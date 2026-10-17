@@ -105,4 +105,7 @@ jobs:
 
       - name: Summary
         if: always()
-        run: echo "upstream-sync result: ${{ steps.sync.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          RESULT: ${{ steps.sync.outputs.result }}
+        run: |
+          echo "upstream-sync result: ${RESULT}" >> "$GITHUB_STEP_SUMMARY"
