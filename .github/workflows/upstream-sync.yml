@@ -86,7 +86,8 @@ jobs:
             echo
             echo "Run: ${RUN_URL}"
             if [ -s /tmp/conflicts.txt ]; then
-              echo; echo "Conflicting files:"; sed 's/^/- `/; s/$/`/' /tmp/conflicts.txt
+              echo; echo "Conflicting files:"
+              while read -r f; do printf -- "- \`%s\`\n" "$f"; done < /tmp/conflicts.txt
             fi
             if [ -s /tmp/push.err ]; then
               echo; echo '```'; tail -n 20 /tmp/push.err; echo '```'
