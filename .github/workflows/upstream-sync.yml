@@ -1,0 +1,108 @@
+# DSCO fork maintenance: keep `main` current with the storytold upstream.
+#
+# - Fast-forwards `main` when it has no fork-only commits; otherwise merges
+#   upstream/main (fork-only commits such as this workflow are preserved).
+# - Never force-pushes and never pushes to the upstream repository.
+# - On a merge conflict or a rejected push, opens (or comments on) a single
+#   tracking issue labelled `upstream-sync` instead of changing `main`.
+#
+# GITHUB_TOKEN cannot push commits that touch .github/workflows/. When upstream
+# changes a workflow file, set a repo/org secret CRAFT_SYNC_TOKEN (a token with
+# `contents` + `workflows` write on this fork) or the push will be rejected and
+# reported as an issue.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository_owner == 'distributed-systems-co'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: storytold/${{ github.event.repository.name }}
+      BRANCH: main
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.CRAFT_SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${BRANCH}"
+          git config user.name "dsco"
+          git config user.email "agent@distributed.systems"
+
+      - name: Fast-forward or merge
+        id: sync
+        run: |
+          set +e
+          ours=$(git rev-parse HEAD)
+          theirs=$(git rev-parse "upstream/${BRANCH}")
+          if git merge-base --is-ancestor "$theirs" "$ours"; then
+            echo "result=up-to-date" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git merge-base --is-ancestor "$ours" "$theirs"; then
+            git merge --ff-only "upstream/${BRANCH}" && mode=fast-forward
+          else
+            git merge --no-edit -m "Merge upstream ${UPSTREAM_REPO}@${theirs:0:12} into ${BRANCH}" \
+              "upstream/${BRANCH}" && mode=merge
+          fi
+          if [ -z "${mode:-}" ]; then
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort 2>/dev/null
+            echo "result=conflict" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! git push origin "HEAD:${BRANCH}" 2> /tmp/push.err; then
+            cat /tmp/push.err
+            echo "result=push-rejected" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "result=${mode}" >> "$GITHUB_OUTPUT"
+
+      - name: Report problem as issue
+        if: steps.sync.outputs.result == 'conflict' || steps.sync.outputs.result == 'push-rejected'
+        env:
+          RESULT: ${{ steps.sync.outputs.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create upstream-sync --color B60205 --description "Upstream sync needs attention" 2>/dev/null || true
+          {
+            echo "Automated upstream sync from \`${UPSTREAM_REPO}\` (\`${BRANCH}\`) failed: **${RESULT}**."
+            echo
+            echo "Run: ${RUN_URL}"
+            if [ -s /tmp/conflicts.txt ]; then
+              echo; echo "Conflicting files:"; sed 's/^/- `/; s/$/`/' /tmp/conflicts.txt
+            fi
+            if [ -s /tmp/push.err ]; then
+              echo; echo '```'; tail -n 20 /tmp/push.err; echo '```'
+              echo; echo "If upstream touched .github/workflows/, configure the CRAFT_SYNC_TOKEN secret."
+            fi
+            echo; echo "Resolve locally: \`git fetch upstream && git merge upstream/${BRANCH}\`, then push to the fork."
+          } > /tmp/body.md
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --label upstream-sync --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${GITHUB_REPOSITORY}" --body-file /tmp/body.md
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --label upstream-sync \
+              --title "Upstream sync ${RESULT}: ${UPSTREAM_REPO}" --body-file /tmp/body.md
+          fi
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: echo "upstream-sync result: ${{ steps.sync.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
