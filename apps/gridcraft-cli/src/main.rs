@@ -9,8 +9,16 @@
 //! gridcraft-cli run [--in FILE | --sample NAME] [--cmd 'id={json}']... [--script FILE.jsonl] [--out FILE] [--print RANGE] [--quiet]
 //! gridcraft-cli commands [--json] [--search X]
 //! gridcraft-cli functions [--json] [--search X] [--category C]
-//! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME]
+//! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--ds] [--ds-endpoint URL]
+//! gridcraft-cli ds (put <file> [ds://name] | get ds://name <out> | ls) [--ds-endpoint URL]
 //! gridcraft-cli send <port> <method> [json]
+//! ```
+//!
+//! Any `<file>`/`--in`/`--out` may be `ds://name.xlsx`: a workbook in the DSCO storage fabric
+//! (see `ds.rs`; needs `DSCO_REPLICATION_KEY`). The MCP server accepts `ds://` paths only with
+//! `--ds`.
+//!
+//! ```text
 //! gridcraft-cli version | --version
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -30,6 +38,7 @@ macro_rules! outln {
 }
 
 mod check;
+mod ds;
 
 use gridcraft_engine::Session;
 use serde_json::{Value, json};
@@ -45,9 +54,14 @@ const USAGE: &str = "usage:
                      [--out FILE] [--print RANGE] [--quiet]
   gridcraft-cli commands [--json] [--search X]
   gridcraft-cli functions [--json] [--search X] [--category C]
-  gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME]
+  gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--ds] [--ds-endpoint URL]
+                     --ds: open_workbook/save_workbook also take ds:// paths (DSCO storage fabric)
+  gridcraft-cli ds put <file> [ds://name] | get ds://name <out> | ls   [--ds-endpoint URL]
   gridcraft-cli send <port> <method> [json]
-  gridcraft-cli version";
+  gridcraft-cli version
+
+  <file>, --in and --out accept ds://name.xlsx (DSCO storage fabric; key in DSCO_REPLICATION_KEY,
+  receiver in GRIDCRAFT_DS_ENDPOINT, default http://127.0.0.1:17610)";
 
 /// stdout went away. A reader that stopped early (a closed pipe) ends the program quietly; any
 /// other write error is reported.
@@ -80,6 +94,7 @@ fn main() -> ExitCode {
         Some("commands") => commands(rest),
         Some("functions") => functions(rest),
         Some("mcp") => mcp(rest),
+        Some("ds") => ds_cmd(rest),
         Some("send") => send(rest),
         Some(other) => Err(format!("unknown subcommand `{other}`\n{USAGE}")),
         None => Err(USAGE.to_string()),
@@ -165,8 +180,31 @@ fn exec(s: &mut Session, id: &str, params: Value) -> Result<Value, String> {
 
 fn open(path: &str) -> Result<Session, String> {
     let mut s = Session::new();
+    if ds::is_ds(path) {
+        let fabric = ds::Fabric::from_env(None)?;
+        ds::open_into(&fabric, &mut |id, p| exec(&mut s, id, p), path, None)?;
+        return Ok(s);
+    }
     exec(&mut s, "file.open", json!({"path": path}))?;
     Ok(s)
+}
+
+/// Saves the active workbook to `out` (a file or `ds://name`); returns the bytes written.
+fn save_to(s: &mut Session, out: &str) -> Result<u64, String> {
+    if ds::is_ds(out) {
+        let fabric = ds::Fabric::from_env(None)?;
+        let saved = ds::save_from(&fabric, &mut |id, p| exec(s, id, p), out)?;
+        eprintln!(
+            "stored {out} in the storage fabric at {} ({} chunks, {} bytes sent, manifest {})",
+            fabric.endpoint.origin(),
+            saved.chunks,
+            saved.transferred_bytes,
+            saved.manifest_sha256
+        );
+        return Ok(saved.bytes as u64);
+    }
+    let r = exec(s, "file.save", json!({"path": out}))?;
+    Ok(r["bytes"].as_u64().unwrap_or(0))
 }
 
 fn blank() -> Session {
@@ -271,11 +309,18 @@ fn convert(args: &[String]) -> Result<(), String> {
     let input = a.pos(0, "<in>")?;
     let out = a.pos(1, "<out>")?;
     a.no_extra(2)?;
-    if gridcraft_engine::io::FileKind::from_path(out).is_none() {
+    if ds::is_ds(out) {
+        ds::format_for(&ds::parse_url(out)?)?;
+    } else if gridcraft_engine::io::FileKind::from_path(out).is_none() {
         return Err(format!("{out}: unknown output format (use .xlsx, .csv, .tsv, .json or .html)"));
     }
     let mut s = open(input)?;
     activate_sheet(&mut s, a.opt("sheet"))?;
+    if ds::is_ds(out) {
+        let n = save_to(&mut s, out)?;
+        eprintln!("wrote {out} ({n} bytes)");
+        return Ok(());
+    }
     let d = s.doc().map_err(|e| e.to_string())?;
     let bytes = gridcraft_engine::io::save_file_bytes(&d.wb, out).map_err(|e| e.to_string())?;
     gridcraft_engine::io::write_file(out, &bytes).map_err(|e| e.to_string())?;
@@ -420,8 +465,8 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     if let Some(out) = a.opt("out") {
-        let r = exec(&mut s, "file.save", json!({"path": out}))?;
-        eprintln!("wrote {out} ({} bytes)", r["bytes"]);
+        let n = save_to(&mut s, out)?;
+        eprintln!("wrote {out} ({n} bytes)");
     }
     for (name, range) in &a.opts {
         if name == "print" {
@@ -496,8 +541,13 @@ fn functions(args: &[String]) -> Result<(), String> {
 /// started with `gridcraft --control PORT`). JSON-RPC on stdin/stdout; logs on stderr.
 fn mcp(args: &[String]) -> Result<(), String> {
     use gridcraft_mcp::{Backend, Headless, Remote, Server, control_addr};
-    let a = Args::parse(args, &["connect", "in", "sample"], &[])?;
+    let a = Args::parse(args, &["connect", "in", "sample", "ds-endpoint"], &["ds"])?;
     a.no_extra(0)?;
+    if a.opt("ds-endpoint").is_some() && !a.has("ds") {
+        return Err("--ds-endpoint needs --ds".into());
+    }
+    // Fail at startup, not on the agent's first ds:// call, when the fabric isn't configured.
+    let fabric = if a.has("ds") { Some(ds::Fabric::from_env(a.opt("ds-endpoint"))?) } else { None };
     let backend: Box<dyn Backend> = match a.opt("connect") {
         Some(c) => {
             let addr = control_addr(c);
@@ -519,10 +569,67 @@ fn mcp(args: &[String]) -> Result<(), String> {
             Box::new(Headless::with_session(session))
         }
     };
+    let backend: Box<dyn Backend> = match fabric {
+        Some(f) => Box::new(ds::DsBackend::new(backend, f)),
+        None => backend,
+    };
     eprintln!("gridcraft-cli: MCP server on stdio ({})", backend.describe());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+}
+
+/// `ds put FILE [ds://name]`, `ds get ds://name OUT`, `ds ls`: move files between disk and the
+/// storage fabric byte for byte (no engine round trip).
+fn ds_cmd(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["ds-endpoint"], &["json"])?;
+    let fabric = ds::Fabric::from_env(a.opt("ds-endpoint"))?;
+    match a.positional.first().map(String::as_str) {
+        Some("put") => {
+            let file = a.pos(1, "<file>")?;
+            a.no_extra(3)?;
+            let url = match a.positional.get(2) {
+                Some(u) => u.clone(),
+                None => {
+                    let name = std::path::Path::new(file).file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{file}: no file name"))?;
+                    format!("{}{name}", ds::SCHEME)
+                }
+            };
+            let meta = std::fs::metadata(file).map_err(|e| format!("{file}: {e}"))?;
+            if meta.len() > ds::MAX_PAYLOAD {
+                return Err(format!("{file}: larger than the {}-byte limit", ds::MAX_PAYLOAD));
+            }
+            let data = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+            let saved = fabric.save(&url, &data)?;
+            outln!("{}", pretty(&saved.to_json()));
+            Ok(())
+        }
+        Some("get") => {
+            let url = a.pos(1, "ds://name")?;
+            let out = a.pos(2, "<out>")?;
+            a.no_extra(3)?;
+            let (_, data) = fabric.open(url)?;
+            gridcraft_engine::io::write_file(out, &data).map_err(|e| e.to_string())?;
+            eprintln!("wrote {out} ({} bytes, verified)", data.len());
+            Ok(())
+        }
+        Some("ls") => {
+            a.no_extra(1)?;
+            let list = fabric.list();
+            if a.has("json") {
+                let v: Vec<Value> = list.iter().map(|(u, n, m)| json!({"path": u, "bytes": n, "manifestSha256": m})).collect();
+                outln!("{}", pretty(&Value::Array(v)));
+            } else {
+                for (u, n, m) in &list {
+                    outln!("{u}\t{n}\t{m}");
+                }
+                eprintln!("{} workbooks at {}", list.len(), fabric.endpoint.origin());
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown ds action `{other}` (put, get or ls)")),
+        None => Err(format!("missing ds action (put, get or ls)\n{USAGE}")),
+    }
 }
 
 /// `send PORT METHOD [JSON]`: one control-channel request to a running app.
