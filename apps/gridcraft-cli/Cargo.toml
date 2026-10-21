@@ -17,6 +17,8 @@ path = "src/main.rs"
 gridcraft-engine = { workspace = true }
 gridcraft-mcp = { workspace = true }
 serde_json = { workspace = true }
+# `ds://` workbooks: chunk digests and HMAC for the DSCO storage fabric protocol.
+sha2 = { workspace = true }
 log = { workspace = true }
 # `check`: validating the packages GridCraft writes (content types, relationships).
 zip = { workspace = true }

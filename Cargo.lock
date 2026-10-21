@@ -1548,6 +1548,7 @@ dependencies = [
  "log",
  "quick-xml",
  "serde_json",
+ "sha2",
  "zip",
 ]
 
